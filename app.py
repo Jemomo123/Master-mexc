@@ -4,26 +4,17 @@ import pandas as pd
 import pandas_ta as ta
 from datetime import datetime
 
-# UI Config
-st.set_page_config(page_title="Multi-Exchange Scanner", layout="wide")
+# Clean Mobile UI
+st.set_page_config(page_title="Expansion Monitor", layout="wide")
 
-def get_exchange(exchange_id):
-    if exchange_id == 'gateio':
-        return ccxt.gateio({
-            'timeout': 20000,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'} # Mandatory for Gate.io Futures
-        })
-    else:
-        return ccxt.mexc({
-            'timeout': 20000,
-            'enableRateLimit': True
-        })
-
-def get_data(exchange_id, symbol, tf):
+def get_data(ex_id, symbol, tf):
     try:
-        ex = get_exchange(exchange_id)
-        # Gate.io sometimes uses '_' instead of '/' in API, CCXT handles this
+        # Use CCXT 2026 unified API domains
+        if ex_id == 'gateio':
+            ex = ccxt.gateio({'timeout': 10000, 'options': {'defaultType': 'swap'}})
+        else:
+            ex = ccxt.mexc({'timeout': 10000})
+            
         bars = ex.fetch_ohlcv(symbol, tf, limit=110)
         if not bars or len(bars) < 100: return None
         
@@ -32,63 +23,70 @@ def get_data(exchange_id, symbol, tf):
         df['SMA100'] = ta.sma(df['c'], 100)
         df['RSI'] = ta.rsi(df['c'], 14)
         return df
-    except Exception as e:
+    except:
         return None
 
-def analyze(exchange_id, symbol):
-    # Fetching the standard 15m/1h/4h bias + 3m/5m triggers
-    tfs = {}
-    for tf in ['3m', '5m', '15m', '1h', '4h']:
-        df = get_data(exchange_id, symbol, tf)
-        if df is None: return []
-        tfs[tf] = df
+def analyze(ex_id, symbol):
+    # Fetch 3m, 5m, 15m, 1h, 4h
+    tfs = {tf: get_data(ex_id, symbol, tf) for tf in ['3m', '5m', '15m', '1h', '4h']}
+    
+    # If API fails, return a simple skip row
+    if any(v is None for v in tfs.values()):
+        return [{
+            "Time": datetime.now().strftime("%H:%M:%S"),
+            "Symbol": symbol.split(':')[0],
+            "Price": "-", "Vol": "-", "TF": "-", "Action": "SKIP", "Tier": "-", "Reason": "API Timeout"
+        }]
 
     # Bias Logic
     b15 = "BULL" if tfs['15m'].iloc[-1]['c'] > tfs['15m'].iloc[-1]['SMA100'] else "BEAR"
     
     results = []
+    timestamp = datetime.now().strftime("%H:%M:%S")
+
     for tf_name in ['3m', '5m']:
         df = tfs[tf_name]
         curr, prev = df.iloc[-1], df.iloc[-2]
         
-        # Triple-Lock Logic
+        # Trigger Logic
         body = abs(curr['c'] - curr['o'])
         avg_body = abs(df['c'] - df['o']).tail(20).mean()
         is_expanding = abs(curr['SMA20'] - curr['SMA100']) > abs(prev['SMA20'] - prev['SMA100'])
         
-        status, tier = "WAIT", "Wait"
+        status, tier, reason = "WAIT", "Wait", "Narrowing"
+
         if (body > avg_body * 2.5) and is_expanding:
             p_dir = "LONG" if curr['c'] > curr['SMA20'] else "SHORT"
             if (p_dir == "LONG" and b15 == "BULL") or (p_dir == "SHORT" and b15 == "BEAR"):
-                status, tier = p_dir, "A"
+                status, tier, reason = p_dir, "A", "Expansion + Bias"
             else:
-                status, tier = p_dir, "Caution"
+                status, tier, reason = p_dir, "Caution", "Bias Conflict"
 
+        # BUILD TABLE (Removed 'Ex' column for cleaner mobile view)
         results.append({
-            "Ex": exchange_id.upper(),
-            "Symbol": symbol,
+            "Time": timestamp,
+            "Symbol": symbol.split(':')[0],
             "Price": f"{curr['c']:.8f}".rstrip('0').rstrip('.'),
             "Vol": f"{curr['v']:,.0f}",
             "TF": tf_name,
             "Action": status,
-            "Tier": tier
+            "Tier": tier,
+            "Reason": reason
         })
     return results
 
-# Combined Watchlist
-gate_watchlist = ["PEPE/USDT", "WIF/USDT", "BONK/USDT"] 
-mexc_watchlist = ["BTC/USDT", "SOL/USDT", "PNUT/USDT"]
+# Combined lists
+mexc_list = ["BTC/USDT", "SOL/USDT", "PNUT/USDT"]
+gate_list = ["PEPE/USDT", "WIF/USDT", "BONK/USDT", "POPCAT/USDT"]
 
-if st.button("🚀 SCAN BOTH EXCHANGES"):
-    all_res = []
-    # Scan Gate.io
-    for coin in gate_watchlist:
-        res = analyze('gateio', coin)
-        if res: all_res.extend(res)
-    # Scan MEXC
-    for coin in mexc_watchlist:
-        res = analyze('mexc', coin)
-        if res: all_res.extend(res)
-    
-    if all_res:
-        st.table(pd.DataFrame(all_res))
+if st.button("🚀 SCAN MARKETS"):
+    all_rows = []
+    # Loop both exchanges
+    for s in mexc_list: all_rows.extend(analyze('mexc', s))
+    for s in gate_list: all_rows.extend(analyze('gateio', s))
+        
+    if all_rows:
+        final_df = pd.DataFrame(all_rows)
+        # Force column order (No Exchange Column)
+        cols = ["Time", "Symbol", "Price", "Vol", "TF", "Action", "Tier", "Reason"]
+        st.table(final_df[cols])
