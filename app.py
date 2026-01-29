@@ -3,62 +3,70 @@ import ccxt
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime
+import time
 
-# UI Config for Mobile
-st.set_page_config(page_title="Expansion Monitor", layout="wide")
-st.title("🛡️ Conviction Edge Scanner")
+# Mobile UI Optimization
+st.set_page_config(page_title="Conviction Edge", layout="wide")
+
+# CSS to make the table look better on mobile
+st.markdown("""
+    <style>
+    .stTable { font-size: 12px !important; }
+    div[data-testid="stMetricValue"] { font-size: 18px !important; }
+    </style>
+    """, unsafe_allow_html=True)
 
 def get_data(symbol, tf):
     try:
-        # Initializing MEXC with a timeout to prevent hanging
+        # Using the unified MEXC API domain for 2026 stability
         ex = ccxt.mexc({'timeout': 10000, 'enableRateLimit': True})
         bars = ex.fetch_ohlcv(symbol, tf, limit=110)
-        if not bars: return None
+        if not bars or len(bars) < 100: return None
+        
         df = pd.DataFrame(bars, columns=['ts','o','h','l','c','v'])
         df['SMA20'] = ta.sma(df['c'], 20)
         df['SMA100'] = ta.sma(df['c'], 100)
         df['RSI'] = ta.rsi(df['c'], 14)
         return df
-    except: return None
+    except:
+        return None
 
 def analyze(symbol):
-    # Timeframes for bias and monitoring
-    tfs_to_fetch = ['3m', '5m', '15m', '1h', '4h']
-    tfs = {}
+    tfs_needed = ['3m', '5m', '15m', '1h', '4h']
+    data_map = {}
     
-    for tf in tfs_to_fetch:
-        data = get_data(symbol, tf)
-        if data is None or len(data) < 101: # Check for enough data for SMA100
-            return [] 
-        tfs[tf] = data
+    for tf in tfs_needed:
+        df = get_data(symbol, tf)
+        if df is None: return [] # Skip if any timeframe fails
+        data_map[tf] = df
 
-    # BIAS CHECK
-    b15 = "BULL" if tfs['15m'].iloc[-1]['c'] > tfs['15m'].iloc[-1]['SMA100'] else "BEAR"
-    b1h = "BULL" if tfs['1h'].iloc[-1]['c'] > tfs['1h'].iloc[-1]['SMA100'] else "BEAR"
-    b4h = "BULL" if tfs['4h'].iloc[-1]['c'] > tfs['4h'].iloc[-1]['SMA100'] else "BEAR"
+    # Bias Rules
+    last_15m = data_map['15m'].iloc[-1]
+    last_1h = data_map['1h'].iloc[-1]
+    last_4h = data_map['4h'].iloc[-1]
+    
+    b15 = "BULL" if last_15m['c'] > last_15m['SMA100'] else "BEAR"
+    b1h = "BULL" if last_1h['c'] > last_1h['SMA100'] else "BEAR"
+    b4h = "BULL" if last_4h['c'] > last_4h['SMA100'] else "BEAR"
     macro_aligned = (b1h == b4h == b15)
 
     results = []
     for tf_name in ['3m', '5m']:
-        df = tfs[tf_name]
+        df = data_map[tf_name]
         curr, prev = df.iloc[-1], df.iloc[-2]
         
-        signal_time = datetime.now().strftime("%H:%M:%S")
-        entry_price = curr['c']
-        vol = curr['v'] # Current volume of the candle
-
-        # Mandatory Bar Confirmation
+        # Expansion Logic
         body = abs(curr['c'] - curr['o'])
         avg_body = abs(df['c'] - df['o']).tail(20).mean()
-        confirmed = (body > avg_body * 2.5) or \
-                    (curr['h'] - max(curr['c'],curr['o']) > body * 2) or \
-                    (min(curr['c'],curr['o']) - curr['l'] > body * 2)
-
         is_expanding = abs(curr['SMA20'] - curr['SMA100']) > abs(prev['SMA20'] - prev['SMA100'])
         
-        status, tier, reason = "WAIT", "Wait", "Searching Setup..."
+        # Bar Confirmation (Elephant/Tail)
+        is_elephant = body > (avg_body * 2.5)
+        is_tail = (curr['h'] - max(curr['c'],curr['o']) > body * 2) or (min(curr['c'],curr['o']) - curr['l'] > body * 2)
+        
+        status, tier, reason = "WAIT", "Wait", "Searching..."
 
-        if confirmed and is_expanding:
+        if (is_elephant or is_tail) and is_expanding:
             p_dir = "LONG" if curr['c'] > curr['SMA20'] else "SHORT"
             is_void = (p_dir == "LONG" and curr['RSI'] > 65) or (p_dir == "SHORT" and curr['RSI'] < 35)
             
@@ -68,13 +76,13 @@ def analyze(symbol):
                 else:
                     status, tier, reason = p_dir, "A", "Expansion + Bias + Bar"
             else:
-                status, tier, reason = p_dir, "Caution", "Bias Conflict (15m)"
+                status, tier, reason = p_dir, "Caution", "Bias Conflict"
 
         results.append({
-            "Time": signal_time,
-            "Symbol": symbol,
-            "Price": f"{entry_price:.8f}".rstrip('0').rstrip('.'),
-            "Vol": f"{vol:,.0f}", # Formatted Volume
+            "Time": datetime.now().strftime("%H:%M:%S"),
+            "Symbol": symbol.replace("/USDT", ""),
+            "Price": f"{curr['c']:.8f}".rstrip('0').rstrip('.'),
+            "Vol": f"{curr['v']:,.0f}",
             "TF": tf_name,
             "Action": status,
             "Tier": tier,
@@ -82,20 +90,35 @@ def analyze(symbol):
         })
     return results
 
-# Expanded Watchlist
-watchlist = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "SPX/USDT", "WIF/USDT", "BONK/USDT", "FLOKI/USDT", "POPCAT/USDT"]
+# CLEANSED LIST (Removed SPX and PUMP due to API instability)
+watchlist = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "WIF/USDT", "BONK/USDT", "POPCAT/USDT", "PEPE/USDT", "PNUT/USDT"]
 
-if st.button("🚀 SCAN CONVICTION"):
-    data = []
-    for coin in watchlist:
-        res = analyze(coin)
-        for r in res: data.append(r)
+# App UI
+col1, col2 = st.columns([3, 1])
+with col1:
+    st.subheader("Live Expansion Feed")
+with col2:
+    if st.button("🔄 REFRESH"):
+        st.rerun()
+
+all_data = []
+progress_bar = st.progress(0)
+
+for i, coin in enumerate(watchlist):
+    res = analyze(coin)
+    if res:
+        all_data.extend(res)
+    progress_bar.progress((i + 1) / len(watchlist))
+
+if all_data:
+    final_df = pd.DataFrame(all_data)
+    # Sort: A+ first, then A, then Caution
+    order = {"A+": 0, "A": 1, "Caution": 2, "Wait": 3}
+    final_df['Sort'] = final_df['Tier'].map(order)
+    final_df = final_df.sort_values('Sort').drop('Sort', axis=1)
     
-    if data:
-        df_final = pd.DataFrame(data)
-        tier_order = {"A+": 0, "A": 1, "Caution": 2, "Wait": 3}
-        df_final['Rank'] = df_final['Tier'].map(tier_order)
-        df_final = df_final.sort_values('Rank').drop('Rank', axis=1)
-        st.table(df_final)
-    else:
-        st.warning("No data found. Check your internet or MEXC API status.")
+    st.table(final_df)
+else:
+    st.error("API Fetch Failed. Please check internet or MEXC status.")
+
+st.caption(f"Last Heartbeat: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
